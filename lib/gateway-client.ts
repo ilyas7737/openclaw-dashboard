@@ -39,6 +39,23 @@ export type GatewayClientOptions = {
 };
 
 const CONNECT_FAILED_CODE = 4008;
+const MAX_RECONNECT_ATTEMPTS = 10;
+
+// HMAC-SHA256 via SubtleCrypto — browser + edge runtime
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 export class GatewayClient {
   private ws: WebSocket | null = null;
@@ -46,11 +63,11 @@ export class GatewayClient {
   private listeners = new Map<string, Set<EventListener>>();
   private closed = false;
   private lastSeq: number | null = null;
-  private connectNonce: string | null = null;
   private connectSent = false;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private backoffMs = 800;
+  private reconnectAttempts = 0;
   private opts: Required<
     Pick<GatewayClientOptions, "url" | "rpcTimeoutMs">
   > &
@@ -72,6 +89,8 @@ export class GatewayClient {
   connect() {
     this.closed = false;
     this.error = null;
+    this.reconnectAttempts = 0;
+    this.backoffMs = 800;
     this.setState("connecting");
     this.doConnect();
   }
@@ -193,8 +212,17 @@ export class GatewayClient {
 
   private scheduleReconnect() {
     if (this.closed) return;
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.error = new Error(
+        `gateway unreachable after ${MAX_RECONNECT_ATTEMPTS} attempts — call connect() to retry`
+      );
+      this.setState("error");
+      this.opts.onError?.(this.error);
+      return;
+    }
     const delay = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 1.7, 15_000);
+    this.reconnectAttempts += 1;
     this.reconnectTimer = setTimeout(() => {
       this.setState("connecting");
       this.doConnect();
@@ -210,16 +238,15 @@ export class GatewayClient {
   }
 
   private queueConnect() {
-    this.connectNonce = null;
     this.connectSent = false;
     if (this.connectTimer) clearTimeout(this.connectTimer);
     // Wait briefly for challenge nonce, then send connect anyway
     this.connectTimer = setTimeout(() => {
-      this.sendConnect();
+      this.sendConnect(null);
     }, 750);
   }
 
-  private sendConnect() {
+  private async sendConnect(nonce: string | null) {
     if (this.connectSent) return;
     this.connectSent = true;
     if (this.connectTimer) {
@@ -227,10 +254,27 @@ export class GatewayClient {
       this.connectTimer = null;
     }
 
-    const auth =
-      this.opts.token || this.opts.password
-        ? { token: this.opts.token, password: this.opts.password }
-        : undefined;
+    // Build auth object. If the gateway challenged us and we have a password,
+    // sign the nonce with HMAC-SHA256 so password-mode gateways accept us.
+    let auth: Record<string, unknown> | undefined;
+    if (this.opts.token || this.opts.password) {
+      auth = {};
+      if (this.opts.token) auth.token = this.opts.token;
+      if (this.opts.password) {
+        auth.password = this.opts.password;
+        if (nonce) {
+          try {
+            auth.challengeResponse = await hmacSha256Hex(
+              this.opts.password,
+              nonce
+            );
+            auth.nonce = nonce;
+          } catch (err) {
+            console.warn("[openclaw] failed to compute HMAC:", err);
+          }
+        }
+      }
+    }
 
     const params = {
       minProtocol: 3,
@@ -254,6 +298,7 @@ export class GatewayClient {
       .then((hello) => {
         this.hello = hello;
         this.backoffMs = 800;
+        this.reconnectAttempts = 0;
         this.setState("connected");
         this.opts.onHello?.(hello);
       })
@@ -278,12 +323,11 @@ export class GatewayClient {
     if (frame.type === "event") {
       const evt = parsed as EventFrame;
 
-      // Handle connect challenge
+      // Handle connect challenge — server sent a nonce; sign it and respond.
       if (evt.event === "connect.challenge") {
         const payload = evt.payload as { nonce?: string } | undefined;
         if (payload?.nonce) {
-          this.connectNonce = payload.nonce;
-          this.sendConnect();
+          this.sendConnect(payload.nonce);
         }
         return;
       }
