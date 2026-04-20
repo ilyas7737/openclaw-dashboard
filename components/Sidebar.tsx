@@ -16,6 +16,7 @@ import {
   Clock,
   Settings,
   ScrollText,
+  DollarSign,
   Wifi,
   WifiOff,
   Loader2,
@@ -32,6 +33,7 @@ const NAV_ITEMS = [
   { href: "/skills", label: "Skills", icon: Zap },
   { href: "/channels", label: "Channels", icon: Radio },
   { href: "/cron", label: "Cron", icon: Clock },
+  { href: "/costs", label: "Costs", icon: DollarSign },
   { href: "/config", label: "Config", icon: Settings },
   { href: "/logs", label: "Logs", icon: ScrollText },
 ];
